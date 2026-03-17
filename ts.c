@@ -30,7 +30,7 @@
 #define DEFAULT_ARENA_CAP      (DEFAULT_BANK_CAP * DEFAULT_BANK_MAX_SUB)
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
-#define MUT_COUNT              7
+#define MUT_COUNT              8
 
 /* ------------------------------------------------------------------ */
 /* Mutation strategy IDs                                               */
@@ -44,21 +44,23 @@ enum {
   MUT_RECURSIVE_SHRINK     = 4,
   MUT_LITERAL_REPLACE      = 5,
   MUT_SUBTREE_DUPLICATE    = 6,
+  MUT_BANK_INSERT          = 7,
 };
 
 static const uint32_t default_weights[MUT_COUNT] = {
     20, /* SUBTREE_DELETE       */
-    25, /* SUBTREE_REPLACE_BANK */
+    20, /* SUBTREE_REPLACE_BANK */
     20, /* SUBTREE_REPLACE_ADD  */
     15, /* SIBLING_SWAP         */
     10, /* RECURSIVE_SHRINK     */
      5, /* LITERAL_REPLACE      */
-     5, /* SUBTREE_DUPLICATE    */
+     3, /* SUBTREE_DUPLICATE    */
+     7, /* BANK_INSERT          */
 };
 
 static const char *mut_names[MUT_COUNT] = {
     "ts-del", "ts-bank", "ts-add", "ts-swap",
-    "ts-shrink", "ts-lit", "ts-dup",
+    "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
 };
 
 /* ------------------------------------------------------------------ */
@@ -683,6 +685,44 @@ static size_t mut_subtree_duplicate(TSMutState *st, const uint8_t *buf,
   return 0;
 }
 
+/* 7: Insert a type-compatible bank subtree adjacent to a node (grows input) */
+static size_t mut_bank_insert(TSMutState *st, const uint8_t *buf,
+                              size_t len, size_t max_size) {
+  if (!st->node_count || !st->bank_count) return 0;
+  bank_rebuild_index(st);
+
+  /* hard cap: don't more than double the input in one mutation */
+  size_t growth_limit = len * 2;
+  if (growth_limit > max_size) growth_limit = max_size;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    uint32_t i = rng_below(st, st->node_count);
+    NodeInfo *n = &st->nodes[i];
+    if (n->parent_idx == UINT32_MAX) continue;
+    TSSymbol sym = n->symbol;
+
+    if (sym >= st->sym_index_size) continue;
+    BankIndex *bi = &st->sym_index[sym];
+    if (bi->count == 0) continue;
+
+    SubtreeEntry *e = &st->bank[bi->start + rng_below(st, bi->count)];
+
+    size_t new_len = len + e->text_len;
+    if (new_len > growth_limit) continue;
+
+    const uint8_t *ins = (const uint8_t *)(st->bank_arena + e->text_offset);
+    ensure_out(st, new_len);
+    if (st->out_cap < new_len) return 0;
+
+    memcpy(st->out_buf, buf, n->end_byte);
+    memcpy(st->out_buf + n->end_byte, ins, e->text_len);
+    memcpy(st->out_buf + n->end_byte + e->text_len,
+           buf + n->end_byte, len - n->end_byte);
+    return new_len;
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Weighted strategy selection                                         */
 /* ------------------------------------------------------------------ */
@@ -728,6 +768,9 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
       case MUT_SUBTREE_DUPLICATE:
         result = mut_subtree_duplicate(st, buf, len, max_size);
         break;
+      case MUT_BANK_INSERT:
+        result = mut_bank_insert(st, buf, len, max_size);
+        break;
     }
 
     if (result) {
@@ -745,8 +788,8 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u",
-                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6]);
+  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u",
+                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7]);
   if (n == MUT_COUNT) {
     memcpy(st->weights, w, sizeof(w));
     st->weight_sum = 0;
@@ -927,6 +970,9 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
         break;
       case MUT_SUBTREE_DUPLICATE:
         result = mut_subtree_duplicate(st, buf, buf_size, max_size);
+        break;
+      case MUT_BANK_INSERT:
+        result = mut_bank_insert(st, buf, buf_size, max_size);
         break;
     }
   }

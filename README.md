@@ -37,12 +37,13 @@ afl-fuzz -i corpus -o out -- ./target @@
 | Strategy | Weight | What it does |
 |---|---|---|
 | `ts-del` | 20 | Delete a named AST subtree |
-| `ts-bank` | 25 | Replace subtree with type-compatible one from corpus bank (`TSSymbol` match) |
+| `ts-bank` | 20 | Replace subtree with type-compatible one from corpus bank (`TSSymbol` match) |
 | `ts-add` | 20 | Replace subtree with type-compatible one from AFL++'s `add_buf` |
 | `ts-swap` | 15 | Swap two sibling nodes of the same type |
 | `ts-shrink` | 10 | Replace node with a same-type descendant (always reduces size) |
 | `ts-lit` | 5 | Replace leaf with random literal |
-| `ts-dup` | 5 | Duplicate a subtree adjacent to itself |
+| `ts-dup` | 3 | Duplicate a subtree adjacent to itself |
+| `ts-ins` | 7 | Insert a type-compatible bank subtree after a node (grows input, capped at 2x) |
 
 The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus grows.
 
@@ -52,7 +53,7 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 |---|---|---|
 | `AFL_TS_GRAMMAR` | **(required)** | Path to grammar `.so` |
 | `AFL_TS_LANG_FUNC` | derived from filename | `tree_sitter_*()` symbol name |
-| `AFL_TS_WEIGHTS` | `20,25,20,15,10,5,5` | Comma-separated strategy weights |
+| `AFL_TS_WEIGHTS` | `20,20,20,15,10,5,3,7` | Comma-separated strategy weights |
 | `AFL_TS_BANK_SIZE` | `8192` | Max subtree bank entries |
 | `AFL_TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
 | `AFL_TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |
