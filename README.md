@@ -6,6 +6,10 @@ Uses [tree-sitter](https://tree-sitter.github.io/) to parse inputs and perform A
 
 Works with any tree-sitter grammar - loaded at runtime via `dlopen`, no recompilation needed.
 
+## Requirements
+
+Requires tree-sitter **v0.25+** (ABI version 15). Older versions are not supported.
+
 ## Build
 
 The mutator builds in-source-tree. Clone AFL++ sources:
@@ -22,7 +26,25 @@ cd ts
 make
 ```
 
-Requires `libtree-sitter` (pkg-config or set `TSPREFIX`).
+If `pkg-config` finds tree-sitter automatically, that's all you need. Otherwise, point `TSPREFIX` to your tree-sitter install prefix:
+
+```
+make TSPREFIX=/path/to/tree-sitter-install
+```
+
+To build tree-sitter v0.25+ from source:
+
+```
+git clone https://github.com/tree-sitter/tree-sitter
+cd tree-sitter && git checkout v0.25.6
+make && make install PREFIX=/path/to/tree-sitter-install
+```
+
+If tree-sitter is installed to a non-standard location, set `LD_LIBRARY_PATH` at runtime:
+
+```
+export LD_LIBRARY_PATH=/path/to/tree-sitter-install/lib
+```
 
 ## Usage
 

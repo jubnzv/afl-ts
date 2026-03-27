@@ -863,7 +863,7 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   if (!ts_parser_set_language(st->parser, st->lang)) {
     FATAL("ts mutator: ABI version mismatch. Grammar version %u, "
           "library supports %u-%u.",
-          ts_language_version(st->lang),
+          ts_language_abi_version(st->lang),
           TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION,
           TREE_SITTER_LANGUAGE_VERSION);
   }
