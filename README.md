@@ -27,7 +27,7 @@ Requires `libtree-sitter` (pkg-config or set `TSPREFIX`).
 ## Usage
 
 ```
-AFL_TS_GRAMMAR=/path/to/your-libtree-sitter.so \
+TS_GRAMMAR=/path/to/your-libtree-sitter.so \
 AFL_CUSTOM_MUTATOR_LIBRARY=./libts.so \
 afl-fuzz -i corpus -o out -- ./target @@
 ```
@@ -51,9 +51,9 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 
 | Variable | Default | Description |
 |---|---|---|
-| `AFL_TS_GRAMMAR` | **(required)** | Path to grammar `.so` |
-| `AFL_TS_LANG_FUNC` | derived from filename | `tree_sitter_*()` symbol name |
-| `AFL_TS_WEIGHTS` | `20,20,20,15,10,5,3,7` | Comma-separated strategy weights |
-| `AFL_TS_BANK_SIZE` | `8192` | Max subtree bank entries |
-| `AFL_TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
-| `AFL_TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |
+| `TS_GRAMMAR` | **(required)** | Path to grammar `.so` |
+| `TS_LANG_FUNC` | derived from filename | `tree_sitter_*()` symbol name |
+| `TS_WEIGHTS` | `20,20,20,15,10,5,3,7` | Comma-separated strategy weights |
+| `TS_BANK_SIZE` | `8192` | Max subtree bank entries |
+| `TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
+| `TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |

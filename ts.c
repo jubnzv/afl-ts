@@ -8,7 +8,7 @@
  * mutations: subtree deletion, cross-input splicing, sibling swapping,
  * recursive shrinking, literal replacement, and subtree duplication.
  *
- * The grammar .so is loaded at runtime via dlopen (AFL_TS_GRAMMAR env var),
+ * The grammar .so is loaded at runtime via dlopen (TS_GRAMMAR env var),
  * so this mutator works with ANY tree-sitter grammar without recompilation.
  */
 
@@ -829,9 +829,9 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   st->last_mutation = -1;
 
   /* -- load grammar via dlopen -- */
-  const char *grammar_path = getenv("AFL_TS_GRAMMAR");
+  const char *grammar_path = getenv("TS_GRAMMAR");
   if (!grammar_path || !grammar_path[0]) {
-    FATAL("ts mutator: AFL_TS_GRAMMAR not set. "
+    FATAL("ts mutator: TS_GRAMMAR not set. "
           "Set it to the path of a tree-sitter grammar .so "
           "(e.g., /usr/lib/libtree-sitter-javascript.so)");
   }
@@ -843,7 +843,7 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
 
   /* resolve language function */
   char func_name[256];
-  const char *func_env = getenv("AFL_TS_LANG_FUNC");
+  const char *func_env = getenv("TS_LANG_FUNC");
   if (func_env && func_env[0]) {
     snprintf(func_name, sizeof(func_name), "%s", func_env);
   } else {
@@ -854,7 +854,7 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   lang_fn_t lang_fn = (lang_fn_t)dlsym(st->grammar_handle, func_name);
   if (!lang_fn) {
     FATAL("ts mutator: dlsym(%s) failed: %s. "
-          "Set AFL_TS_LANG_FUNC to the correct symbol name.",
+          "Set TS_LANG_FUNC to the correct symbol name.",
           func_name, dlerror());
   }
 
@@ -869,12 +869,12 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   }
 
   /* -- init bank -- */
-  const char *bank_size_str = getenv("AFL_TS_BANK_SIZE");
+  const char *bank_size_str = getenv("TS_BANK_SIZE");
   st->bank_cap = bank_size_str ? (uint32_t)atoi(bank_size_str) : DEFAULT_BANK_CAP;
   if (st->bank_cap == 0) st->bank_cap = DEFAULT_BANK_CAP;
   st->bank = calloc(st->bank_cap, sizeof(SubtreeEntry));
 
-  const char *max_sub_str = getenv("AFL_TS_BANK_MAX_SUBTREE");
+  const char *max_sub_str = getenv("TS_BANK_MAX_SUBTREE");
   st->bank_max_subtree = max_sub_str ? (uint32_t)atoi(max_sub_str)
                                      : DEFAULT_BANK_MAX_SUB;
   if (st->bank_max_subtree == 0) st->bank_max_subtree = DEFAULT_BANK_MAX_SUB;
@@ -886,9 +886,9 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   memcpy(st->weights, default_weights, sizeof(default_weights));
   st->weight_sum = 0;
   for (int i = 0; i < MUT_COUNT; i++) st->weight_sum += st->weights[i];
-  parse_weights(st, getenv("AFL_TS_WEIGHTS"));
+  parse_weights(st, getenv("TS_WEIGHTS"));
 
-  const char *hp = getenv("AFL_TS_HAVOC_PROB");
+  const char *hp = getenv("TS_HAVOC_PROB");
   st->havoc_prob = hp ? (uint8_t)atoi(hp) : DEFAULT_HAVOC_PROB;
 
   OKF("ts mutator: loaded grammar %s (func=%s, symbols=%u, bank_cap=%u)",
