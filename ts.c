@@ -15,6 +15,7 @@
 #include "afl-fuzz.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,41 @@ static const char *mut_names[MUT_COUNT] = {
     "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
     "ts-range",
 };
+
+/* ------------------------------------------------------------------ */
+/* Numeric literal tables (used by ts-lit)                             */
+/* ------------------------------------------------------------------ */
+
+/* Boundary values that shake loose off-by-one, unsigned wraps, and
+   signed/unsigned confusion in target code. */
+static const int64_t TS_LIT_SMALL[] = {
+    -1, 0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 100,
+    127, 128, 255, 256, 511, 512, 1000, 1024, 4096,
+    32767, 32768, 65535, 65536, 1000000,
+    2147483647LL, -2147483648LL, 4294967295LL,
+};
+#define TS_LIT_SMALL_N (sizeof(TS_LIT_SMALL) / sizeof(TS_LIT_SMALL[0]))
+
+/* Values too wide for int64; emitted verbatim. */
+static const char *TS_LIT_BIG[] = {
+    "9223372036854775807",
+    "9223372036854775808",
+    "18446744073709551615",
+    "18446744073709551616",
+    "0xffffffffffffffff",
+    "0x10000000000000000",
+    "170141183460469231731687303715884105727",
+    "340282366920938463463374607431768211455",
+    "340282366920938463463374607431768211456",
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+};
+#define TS_LIT_BIG_N (sizeof(TS_LIT_BIG) / sizeof(TS_LIT_BIG[0]))
+
+/* Deltas to apply to the current value. */
+static const int32_t TS_LIT_DELTAS[] = {
+    1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 65536,
+};
+#define TS_LIT_DELTAS_N (sizeof(TS_LIT_DELTAS) / sizeof(TS_LIT_DELTAS[0]))
 
 /* ------------------------------------------------------------------ */
 /* Data structures                                                     */
@@ -695,6 +731,41 @@ static size_t mut_recursive_shrink(TSMutState *st, const uint8_t *buf,
   return 0;
 }
 
+/* Parse a numeric leaf. Returns 1 on success (value in *out), 0 otherwise.
+   Handles plain decimal and 0x/0X hex; ignores malformed tails by treating
+   them as failures. `text` is not null-terminated. */
+static int ts_lit_parse_current(const char *text, uint32_t nlen,
+                                int64_t *out) {
+  char tmp[32];
+  if (nlen == 0 || nlen >= sizeof(tmp)) return 0;
+  memcpy(tmp, text, nlen);
+  tmp[nlen] = '\0';
+
+  const char *p = tmp;
+  int base = 10;
+  if (nlen > 2 && tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) {
+    base = 16;
+    p = tmp + 2;
+  }
+  errno = 0;
+  char *end = NULL;
+  long long v = strtoll(p, &end, base);
+  if (errno == ERANGE || end == p) return 0;
+  *out = (int64_t)v;
+  return 1;
+}
+
+/* Format an int64 into `out` as either decimal or hex (25% hex). Returns
+   bytes written (not including NUL). */
+static size_t ts_lit_emit_int(TSMutState *st, int64_t v,
+                              char *out, size_t out_cap) {
+  if (rng_below(st, 4) == 0) {
+    uint64_t u = (uint64_t)v;
+    return (size_t)snprintf(out, out_cap, "0x%llx", (unsigned long long)u);
+  }
+  return (size_t)snprintf(out, out_cap, "%lld", (long long)v);
+}
+
 /* 5: Replace a leaf node with a random literal (language-agnostic heuristic) */
 static size_t mut_literal_replace(TSMutState *st, const uint8_t *buf,
                                   size_t len, size_t max_size) {
@@ -708,13 +779,53 @@ static size_t mut_literal_replace(TSMutState *st, const uint8_t *buf,
   size_t repl_len = 0;
 
   if (nlen > 0 && (text[0] >= '0' && text[0] <= '9')) {
-    /* numeric */
-    if (rng_below(st, 4) == 0) {
-      unsigned v = 1u + rng_below(st, 0xFFFF);
-      repl_len = (size_t)snprintf(repl, sizeof(repl), "0x%X", v);
+    /* numeric: mix of boundary values, deltas, random, and wide literals */
+    int64_t cur = 0;
+    int have_cur = ts_lit_parse_current(text, nlen, &cur);
+
+    uint32_t pick = rng_below(st, 100);
+    /* If we couldn't parse the current value, the delta path can't fire.
+       Reroute its mass into the random-bounded range so weights stay even. */
+    if (!have_cur && pick >= 40 && pick < 70) {
+      pick = 70 + rng_below(st, 20);
+    }
+
+    if (pick < 40) {
+      int64_t v = TS_LIT_SMALL[rng_below(st, TS_LIT_SMALL_N)];
+      repl_len = ts_lit_emit_int(st, v, repl, sizeof(repl));
+
+    } else if (pick < 70) {
+      int32_t d = TS_LIT_DELTAS[rng_below(st, TS_LIT_DELTAS_N)];
+      /* Unsigned math avoids signed-overflow UB; cast back for printing. */
+      uint64_t uc = (uint64_t)cur;
+      uint64_t uv;
+      switch (rng_below(st, 6)) {
+        case 0:  uv = uc + (uint64_t)(uint32_t)d; break;
+        case 1:  uv = uc - (uint64_t)(uint32_t)d; break;
+        case 2:  uv = uc << 1; break;
+        case 3:  uv = uc >> 1; break;
+        case 4:  uv = uc ^ 0xFFull; break;
+        default: uv = uc ^ 0xFFFFFFFFull; break;
+      }
+      repl_len = ts_lit_emit_int(st, (int64_t)uv, repl, sizeof(repl));
+
+    } else if (pick < 90) {
+      /* preserved original random-bounded path */
+      if (rng_below(st, 4) == 0) {
+        unsigned v = 1u + rng_below(st, 0xFFFF);
+        repl_len = (size_t)snprintf(repl, sizeof(repl), "0x%X", v);
+      } else {
+        unsigned v = rng_below(st, 100000u);
+        repl_len = (size_t)snprintf(repl, sizeof(repl), "%u", v);
+      }
+
     } else {
-      unsigned v = rng_below(st, 100000u);
-      repl_len = (size_t)snprintf(repl, sizeof(repl), "%u", v);
+      /* wide literal, emitted verbatim */
+      const char *s = TS_LIT_BIG[rng_below(st, TS_LIT_BIG_N)];
+      size_t slen = strlen(s);
+      if (slen >= sizeof(repl)) slen = sizeof(repl) - 1;
+      memcpy(repl, s, slen);
+      repl_len = slen;
     }
   } else if (nlen > 0 && (text[0] == '"' || text[0] == '\'')) {
     /* string */
