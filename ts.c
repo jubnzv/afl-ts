@@ -828,9 +828,25 @@ static size_t mut_literal_replace(TSMutState *st, const uint8_t *buf,
       repl_len = slen;
     }
   } else if (nlen > 0 && (text[0] == '"' || text[0] == '\'')) {
-    /* string */
-    static const char *samples[] = {"\"\"", "\"A\"", "\"foo\"", "\"%d\"", "\"\\n\""};
-    const char *s = samples[rng_below(st, 5)];
+    /* string: empty/minimal, format specifiers, control bytes,
+       embedded quote/backslash, numeric specials, BOM-ish */
+    static const char *samples[] = {
+      /* empty / minimal */
+      "\"\"", "\"A\"", "\"foo\"",
+      /* format specifiers — lexer / printf-style surprises */
+      "\"%s\"", "\"%d\"", "\"%n\"", "\"%p\"", "\"%#x\"", "\"aaaa%d%n\"",
+      /* embedded control / escape bytes */
+      "\"\\n\"", "\"\\r\\n\"", "\"\\0\"", "\"\\x00\"",
+      "\"\\x0a\"", "\"\\x0d\"", "\"\\xff\"",
+      /* embedded backslash / quote */
+      "\"\\\\\"", "\"\\\"\"",
+      /* Unicode escapes, including NUL and BOM */
+      "\"\\u0000\"", "\"\\ufeff\"",
+      /* numeric specials if the target ever parses strings as numbers */
+      "\"NaN\"", "\"+inf\"", "\"-inf\"",
+    };
+    const size_t nsamples = sizeof(samples) / sizeof(samples[0]);
+    const char *s = samples[rng_below(st, nsamples)];
     repl_len = strlen(s);
     if (repl_len >= sizeof(repl)) repl_len = sizeof(repl) - 1;
     memcpy(repl, s, repl_len);
