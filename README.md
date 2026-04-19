@@ -66,6 +66,7 @@ afl-fuzz -i corpus -o out -- ./target @@
 | `ts-lit` | 5 | Replace leaf with random literal |
 | `ts-dup` | 3 | Duplicate a subtree adjacent to itself |
 | `ts-ins` | 7 | Insert a type-compatible bank subtree after a node (grows input, capped at 2x) |
+| `ts-range` | 4 | Replace a contiguous run of same-symbol siblings with a same-symbol run from `add_buf` or 1..3 concatenated bank entries |
 
 The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus grows.
 
@@ -75,7 +76,7 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 |---|---|---|
 | `TS_GRAMMAR` | **(required)** | Path to grammar `.so` |
 | `TS_LANG_FUNC` | derived from filename | `tree_sitter_*()` symbol name |
-| `TS_WEIGHTS` | `20,20,20,15,10,5,3,7` | Comma-separated strategy weights |
+| `TS_WEIGHTS` | `20,20,20,15,10,5,3,7,4` | Comma-separated strategy weights |
 | `TS_BANK_SIZE` | `8192` | Max subtree bank entries |
 | `TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
 | `TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |

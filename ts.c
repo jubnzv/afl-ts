@@ -30,7 +30,7 @@
 #define DEFAULT_ARENA_CAP      (DEFAULT_BANK_CAP * DEFAULT_BANK_MAX_SUB)
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
-#define MUT_COUNT              8
+#define MUT_COUNT              9
 
 /* ------------------------------------------------------------------ */
 /* Mutation strategy IDs                                               */
@@ -45,6 +45,7 @@ enum {
   MUT_LITERAL_REPLACE      = 5,
   MUT_SUBTREE_DUPLICATE    = 6,
   MUT_BANK_INSERT          = 7,
+  MUT_RANGE_SPLICE         = 8,
 };
 
 static const uint32_t default_weights[MUT_COUNT] = {
@@ -56,11 +57,13 @@ static const uint32_t default_weights[MUT_COUNT] = {
      5, /* LITERAL_REPLACE      */
      3, /* SUBTREE_DUPLICATE    */
      7, /* BANK_INSERT          */
+     4, /* RANGE_SPLICE         */
 };
 
 static const char *mut_names[MUT_COUNT] = {
     "ts-del", "ts-bank", "ts-add", "ts-swap",
     "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
+    "ts-range",
 };
 
 /* ------------------------------------------------------------------ */
@@ -91,6 +94,16 @@ typedef struct {
   uint32_t a;
   uint32_t b;
 } SibPair;
+
+/* A run of direct children of one parent that all share a symbol.
+   Children in [start, start+count) inside sib_group_members are kept
+   in source order so a contiguous slice maps to a contiguous byte range. */
+typedef struct {
+  uint32_t parent_idx;
+  TSSymbol symbol;
+  uint32_t start;
+  uint32_t count;
+} SibGroup;
 
 typedef struct {
   /* tree-sitter core */
@@ -127,6 +140,18 @@ typedef struct {
   SibPair  *sib_pairs;    /* swappable sibling pairs */
   uint32_t  sib_count;
   uint32_t  sib_cap;
+
+  /* sibling groups of >=2 same-symbol direct children */
+  SibGroup *sib_groups;
+  uint32_t  sib_group_count;
+  uint32_t  sib_group_cap;
+  uint32_t *sib_group_members;
+  uint32_t  sib_group_members_count;
+  uint32_t  sib_group_members_cap;
+
+  /* scratch buffer for concatenating bank donors during range splice */
+  uint8_t  *range_scratch;
+  uint32_t  range_scratch_cap;
 
   /* subtree bank */
   SubtreeEntry *bank;
@@ -240,6 +265,8 @@ static void collect_nodes(TSMutState *st, TSTree *tree) {
   st->node_count = 0;
   st->leaf_count = 0;
   st->sib_count = 0;
+  st->sib_group_count = 0;
+  st->sib_group_members_count = 0;
   TSNode root = ts_tree_root_node(tree);
   if (ts_node_is_null(root)) return;
 
@@ -311,6 +338,64 @@ static void collect_nodes(TSMutState *st, TSTree *tree) {
           st->sib_count++;
           break; /* one pair per node is enough */
         }
+      }
+    }
+  }
+
+  /* Second post-pass: for each parent with >=2 named children, emit one
+     SibGroup per run of same-symbol children, preserving source order. */
+  #define SIB_MEMBERS_HARD_CAP 65536u
+  for (uint32_t p = 0; p < st->node_count; p++) {
+    if (st->nodes[p].named_children < 2) continue;
+    if (st->sib_group_members_count >= SIB_MEMBERS_HARD_CAP) break;
+
+    /* Collect direct children of p in source order (DFS order already is). */
+    uint32_t kids_start = st->sib_group_members_count;
+    uint32_t kids_count = 0;
+    for (uint32_t c = p + 1; c < st->node_count; c++) {
+      if (st->nodes[c].start_byte >= st->nodes[p].end_byte) break;
+      if (st->nodes[c].parent_idx != p) continue;
+      GROW_ARRAY(st->sib_group_members, st->sib_group_members_count,
+                 st->sib_group_members_cap, uint32_t, 256);
+      st->sib_group_members[st->sib_group_members_count++] = c;
+      kids_count++;
+    }
+    if (kids_count < 2) {
+      st->sib_group_members_count = kids_start;
+      continue;
+    }
+
+    /* Stable insertion sort by symbol; same-symbol children keep their
+       relative (source) order, so contiguous runs are contiguous in bytes. */
+    uint32_t *kids = &st->sib_group_members[kids_start];
+    for (uint32_t a = 1; a < kids_count; a++) {
+      uint32_t v = kids[a];
+      TSSymbol sv = st->nodes[v].symbol;
+      uint32_t b = a;
+      while (b > 0 && st->nodes[kids[b - 1]].symbol > sv) {
+        kids[b] = kids[b - 1];
+        b--;
+      }
+      kids[b] = v;
+    }
+
+    /* Emit a group for each run of length >=2. */
+    uint32_t run_start = 0;
+    for (uint32_t k = 1; k <= kids_count; k++) {
+      int boundary = (k == kids_count) ||
+          (st->nodes[kids[k]].symbol != st->nodes[kids[run_start]].symbol);
+      if (boundary) {
+        uint32_t run_len = k - run_start;
+        if (run_len >= 2) {
+          GROW_ARRAY(st->sib_groups, st->sib_group_count,
+                     st->sib_group_cap, SibGroup, 64);
+          SibGroup *g = &st->sib_groups[st->sib_group_count++];
+          g->parent_idx = p;
+          g->symbol = st->nodes[kids[run_start]].symbol;
+          g->start = kids_start + run_start;
+          g->count = run_len;
+        }
+        run_start = k;
       }
     }
   }
@@ -723,6 +808,96 @@ static size_t mut_bank_insert(TSMutState *st, const uint8_t *buf,
   return 0;
 }
 
+/* 8: Range splice. Pick a sibling group (>=2 same-symbol children under one
+      parent), pick a contiguous destination slice of that group, then replace
+      those bytes with either a slice of same-symbol nodes drawn from add_buf
+      or a concatenation of 1..3 same-symbol bank entries. */
+static size_t mut_range_splice(TSMutState *st, const uint8_t *buf, size_t len,
+                               const uint8_t *add_buf, size_t add_len,
+                               size_t max_size) {
+  if (!st->sib_group_count) return 0;
+  if (!st->range_scratch || !st->range_scratch_cap) return 0;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    SibGroup *g = &st->sib_groups[rng_below(st, st->sib_group_count)];
+    uint32_t *members = &st->sib_group_members[g->start];
+
+    /* Destination slice [di, dj) inside the group. */
+    uint32_t di = rng_below(st, g->count);
+    uint32_t dj = di + 1 + rng_below(st, g->count - di);
+    NodeInfo *first = &st->nodes[members[di]];
+    NodeInfo *last  = &st->nodes[members[dj - 1]];
+    uint32_t dst_start = first->start_byte;
+    uint32_t dst_end   = last->end_byte;
+    if (dst_end <= dst_start) continue;
+
+    const uint8_t *src_ptr = NULL;
+    uint32_t src_len = 0;
+
+    /* Prefer add_buf when available and coin-flip favorable. */
+    int use_add = add_buf && add_len && (rng_below(st, 2) == 0);
+    if (use_add) {
+      parse_add_cached(st, add_buf, add_len);
+      if (!st->add_node_count) use_add = 0;
+    }
+
+    if (use_add) {
+      TSSymbol want = g->symbol;
+      uint32_t pick = rng_below(st, st->add_node_count);
+      uint32_t found = UINT32_MAX;
+      for (uint32_t k = 0; k < st->add_node_count; k++) {
+        uint32_t idx = (pick + k) % st->add_node_count;
+        if (st->add_nodes[idx].symbol == want) { found = idx; break; }
+      }
+      if (found != UINT32_MAX) {
+        uint32_t s_start = st->add_nodes[found].start_byte;
+        uint32_t s_end   = st->add_nodes[found].end_byte;
+        uint32_t want_runs = 1 + rng_below(st, 3);
+        uint32_t runs = 1;
+        for (uint32_t k = found + 1;
+             k < st->add_node_count && runs < want_runs; k++) {
+          if (st->add_nodes[k].symbol != want) continue;
+          if (st->add_nodes[k].start_byte < s_end) continue; /* nested */
+          s_end = st->add_nodes[k].end_byte;
+          runs++;
+        }
+        if (s_end <= add_len && s_end > s_start) {
+          src_ptr = add_buf + s_start;
+          src_len = s_end - s_start;
+        }
+      }
+    }
+
+    if (!src_ptr) {
+      /* Fall back to the bank: stitch 1..3 same-symbol entries into scratch. */
+      if (!st->bank_count) continue;
+      bank_rebuild_index(st);
+      if (g->symbol >= st->sym_index_size) continue;
+      BankIndex *bi = &st->sym_index[g->symbol];
+      if (bi->count == 0) continue;
+
+      uint32_t n_take = 1 + rng_below(st, 3);
+      uint32_t acc = 0;
+      for (uint32_t k = 0; k < n_take; k++) {
+        SubtreeEntry *e = &st->bank[bi->start + rng_below(st, bi->count)];
+        uint32_t need = e->text_len + (k > 0 ? 1 : 0);
+        if (acc + need > st->range_scratch_cap) break;
+        if (k > 0) st->range_scratch[acc++] = ' ';
+        memcpy(st->range_scratch + acc,
+               st->bank_arena + e->text_offset, e->text_len);
+        acc += e->text_len;
+      }
+      if (!acc) continue;
+      src_ptr = st->range_scratch;
+      src_len = acc;
+    }
+
+    return splice_output(st, buf, len, dst_start, src_ptr, src_len,
+                         dst_end, max_size);
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Weighted strategy selection                                         */
 /* ------------------------------------------------------------------ */
@@ -771,6 +946,9 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
       case MUT_BANK_INSERT:
         result = mut_bank_insert(st, buf, len, max_size);
         break;
+      case MUT_RANGE_SPLICE:
+        result = mut_range_splice(st, buf, len, add_buf, add_len, max_size);
+        break;
     }
 
     if (result) {
@@ -788,8 +966,8 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u",
-                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7]);
+  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u",
+                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7], &w[8]);
   if (n == MUT_COUNT) {
     memcpy(st->weights, w, sizeof(w));
     st->weight_sum = 0;
@@ -882,6 +1060,11 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   st->sym_index_size = ts_language_symbol_count(st->lang);
   st->sym_index = calloc(st->sym_index_size, sizeof(BankIndex));
 
+  /* Range-splice scratch: enough to stitch ~3 max-size bank entries + seps. */
+  st->range_scratch_cap = st->bank_max_subtree * 4;
+  st->range_scratch = malloc(st->range_scratch_cap);
+  if (!st->range_scratch) st->range_scratch_cap = 0;
+
   /* -- init weights -- */
   memcpy(st->weights, default_weights, sizeof(default_weights));
   st->weight_sum = 0;
@@ -973,6 +1156,9 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
         break;
       case MUT_BANK_INSERT:
         result = mut_bank_insert(st, buf, buf_size, max_size);
+        break;
+      case MUT_RANGE_SPLICE:
+        result = mut_range_splice(st, buf, buf_size, NULL, 0, max_size);
         break;
     }
   }
@@ -1084,6 +1270,9 @@ void afl_custom_deinit(void *data) {
   free(st->add_nodes);
   free(st->leaf_idx);
   free(st->sib_pairs);
+  free(st->sib_groups);
+  free(st->sib_group_members);
+  free(st->range_scratch);
   free(st->bank);
   free(st->bank_arena);
   free(st->sym_index);
