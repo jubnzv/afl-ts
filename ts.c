@@ -31,7 +31,7 @@
 #define DEFAULT_ARENA_CAP      (DEFAULT_BANK_CAP * DEFAULT_BANK_MAX_SUB)
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
-#define MUT_COUNT              9
+#define MUT_COUNT              10
 
 /* ------------------------------------------------------------------ */
 /* Mutation strategy IDs                                               */
@@ -47,6 +47,7 @@ enum {
   MUT_SUBTREE_DUPLICATE    = 6,
   MUT_BANK_INSERT          = 7,
   MUT_RANGE_SPLICE         = 8,
+  MUT_CHAOS                = 9,
 };
 
 static const uint32_t default_weights[MUT_COUNT] = {
@@ -59,12 +60,13 @@ static const uint32_t default_weights[MUT_COUNT] = {
      3, /* SUBTREE_DUPLICATE    */
      7, /* BANK_INSERT          */
      4, /* RANGE_SPLICE         */
+     2, /* CHAOS                */
 };
 
 static const char *mut_names[MUT_COUNT] = {
     "ts-del", "ts-bank", "ts-add", "ts-swap",
     "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
-    "ts-range",
+    "ts-range", "ts-chaos",
 };
 
 /* ------------------------------------------------------------------ */
@@ -214,6 +216,11 @@ typedef struct {
   /* description */
   char desc_buf[64];
   int  last_mutation;
+
+  /* chaos modifier — set by dispatcher when MUT_CHAOS fires, cleared
+     immediately after the underlying strategy runs. When set, the
+     bank/add/range strategies skip their TSSymbol filter. */
+  uint8_t chaos_active;
 
 } TSMutState;
 
@@ -611,20 +618,26 @@ static size_t mut_subtree_delete(TSMutState *st, const uint8_t *buf,
 static size_t mut_subtree_replace_bank(TSMutState *st, const uint8_t *buf,
                                        size_t len, size_t max_size) {
   if (!st->node_count || !st->bank_count) return 0;
-  bank_rebuild_index(st);
+  if (!st->chaos_active) bank_rebuild_index(st);
 
   for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
     uint32_t i = rng_below(st, st->node_count);
     NodeInfo *n = &st->nodes[i];
-    TSSymbol sym = n->symbol;
 
-    if (sym >= st->sym_index_size) continue;
-    BankIndex *bi = &st->sym_index[sym];
-    if (bi->count == 0) continue;
+    SubtreeEntry *e;
+    if (st->chaos_active) {
+      /* pick any bank entry regardless of symbol — deliberately breaks
+         type-safety to stress parse-error recovery paths */
+      e = &st->bank[rng_below(st, st->bank_count)];
+    } else {
+      TSSymbol sym = n->symbol;
+      if (sym >= st->sym_index_size) continue;
+      BankIndex *bi = &st->sym_index[sym];
+      if (bi->count == 0) continue;
+      e = &st->bank[bi->start + rng_below(st, bi->count)];
+    }
 
-    SubtreeEntry *e = &st->bank[bi->start + rng_below(st, bi->count)];
     const uint8_t *repl = (const uint8_t *)(st->bank_arena + e->text_offset);
-
     return splice_output(st, buf, len, n->start_byte, repl, e->text_len,
                          n->end_byte, max_size);
   }
@@ -643,9 +656,21 @@ static size_t mut_subtree_replace_add(TSMutState *st, const uint8_t *buf,
   for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
     uint32_t ti = rng_below(st, st->node_count);
     NodeInfo *target = &st->nodes[ti];
-    TSSymbol sym = target->symbol;
 
-    /* find matching node in cached add_buf nodes */
+    if (st->chaos_active) {
+      /* pick any add_buf node regardless of symbol */
+      uint32_t ai = rng_below(st, st->add_node_count);
+      uint32_t astart = st->add_nodes[ai].start_byte;
+      uint32_t aend = st->add_nodes[ai].end_byte;
+      if (aend > astart && aend <= add_len) {
+        return splice_output(st, buf, len, target->start_byte,
+                             add_buf + astart, aend - astart,
+                             target->end_byte, max_size);
+      }
+      continue;
+    }
+
+    TSSymbol sym = target->symbol;
     uint32_t start = rng_below(st, st->add_node_count);
     for (uint32_t j = 0; j < st->add_node_count; j++) {
       uint32_t ai = (start + j) % st->add_node_count;
@@ -969,24 +994,32 @@ static size_t mut_range_splice(TSMutState *st, const uint8_t *buf, size_t len,
     }
 
     if (use_add) {
-      TSSymbol want = g->symbol;
-      uint32_t pick = rng_below(st, st->add_node_count);
       uint32_t found = UINT32_MAX;
-      for (uint32_t k = 0; k < st->add_node_count; k++) {
-        uint32_t idx = (pick + k) % st->add_node_count;
-        if (st->add_nodes[idx].symbol == want) { found = idx; break; }
+      if (st->chaos_active) {
+        /* any node, any symbol */
+        found = rng_below(st, st->add_node_count);
+      } else {
+        TSSymbol want = g->symbol;
+        uint32_t pick = rng_below(st, st->add_node_count);
+        for (uint32_t k = 0; k < st->add_node_count; k++) {
+          uint32_t idx = (pick + k) % st->add_node_count;
+          if (st->add_nodes[idx].symbol == want) { found = idx; break; }
+        }
       }
       if (found != UINT32_MAX) {
         uint32_t s_start = st->add_nodes[found].start_byte;
         uint32_t s_end   = st->add_nodes[found].end_byte;
-        uint32_t want_runs = 1 + rng_below(st, 3);
-        uint32_t runs = 1;
-        for (uint32_t k = found + 1;
-             k < st->add_node_count && runs < want_runs; k++) {
-          if (st->add_nodes[k].symbol != want) continue;
-          if (st->add_nodes[k].start_byte < s_end) continue; /* nested */
-          s_end = st->add_nodes[k].end_byte;
-          runs++;
+        if (!st->chaos_active) {
+          uint32_t want_runs = 1 + rng_below(st, 3);
+          uint32_t runs = 1;
+          TSSymbol want = g->symbol;
+          for (uint32_t k = found + 1;
+               k < st->add_node_count && runs < want_runs; k++) {
+            if (st->add_nodes[k].symbol != want) continue;
+            if (st->add_nodes[k].start_byte < s_end) continue; /* nested */
+            s_end = st->add_nodes[k].end_byte;
+            runs++;
+          }
         }
         if (s_end <= add_len && s_end > s_start) {
           src_ptr = add_buf + s_start;
@@ -996,17 +1029,27 @@ static size_t mut_range_splice(TSMutState *st, const uint8_t *buf, size_t len,
     }
 
     if (!src_ptr) {
-      /* Fall back to the bank: stitch 1..3 same-symbol entries into scratch. */
+      /* Fall back to the bank: stitch 1..3 entries into scratch. Chaos
+         mode draws any entries; normal mode matches g->symbol. */
       if (!st->bank_count) continue;
-      bank_rebuild_index(st);
-      if (g->symbol >= st->sym_index_size) continue;
-      BankIndex *bi = &st->sym_index[g->symbol];
-      if (bi->count == 0) continue;
+
+      BankIndex *bi = NULL;
+      if (!st->chaos_active) {
+        bank_rebuild_index(st);
+        if (g->symbol >= st->sym_index_size) continue;
+        bi = &st->sym_index[g->symbol];
+        if (bi->count == 0) continue;
+      }
 
       uint32_t n_take = 1 + rng_below(st, 3);
       uint32_t acc = 0;
       for (uint32_t k = 0; k < n_take; k++) {
-        SubtreeEntry *e = &st->bank[bi->start + rng_below(st, bi->count)];
+        SubtreeEntry *e;
+        if (st->chaos_active) {
+          e = &st->bank[rng_below(st, st->bank_count)];
+        } else {
+          e = &st->bank[bi->start + rng_below(st, bi->count)];
+        }
         uint32_t need = e->text_len + (k > 0 ? 1 : 0);
         if (acc + need > st->range_scratch_cap) break;
         if (k > 0) st->range_scratch[acc++] = ' ';
@@ -1043,10 +1086,23 @@ static int select_strategy(TSMutState *st) {
 static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
                              const uint8_t *add_buf, size_t add_len,
                              size_t max_size) {
+  /* Chaos delegation targets: the three bank/add/range strategies. */
+  static const int chaos_targets[3] = {
+    MUT_SUBTREE_REPLACE_BANK,
+    MUT_SUBTREE_REPLACE_ADD,
+    MUT_RANGE_SPLICE,
+  };
+
   for (int retry = 0; retry < MAX_RETRIES; retry++) {
     int strat = select_strategy(st);
-    size_t result = 0;
+    int chaos = 0;
+    if (strat == MUT_CHAOS) {
+      chaos = 1;
+      strat = chaos_targets[rng_below(st, 3)];
+    }
+    st->chaos_active = (uint8_t)chaos;
 
+    size_t result = 0;
     switch (strat) {
       case MUT_SUBTREE_DELETE:
         result = mut_subtree_delete(st, buf, len, max_size);
@@ -1077,9 +1133,10 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
         result = mut_range_splice(st, buf, len, add_buf, add_len, max_size);
         break;
     }
+    st->chaos_active = 0;
 
     if (result) {
-      st->last_mutation = strat;
+      st->last_mutation = chaos ? MUT_CHAOS : strat;
       return result;
     }
   }
@@ -1093,8 +1150,9 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u",
-                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7], &w[8]);
+  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7],
+                 &w[8], &w[9]);
   if (n == MUT_COUNT) {
     memcpy(st->weights, w, sizeof(w));
     st->weight_sum = 0;
@@ -1255,12 +1313,24 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
     return buf_size;
   }
 
-  /* havoc mode: skip add_buf-based splicing */
+  /* havoc mode: skip add_buf-based splicing. Chaos in havoc can only
+     target bank + range (no add_buf available). */
+  static const int chaos_havoc_targets[2] = {
+    MUT_SUBTREE_REPLACE_BANK,
+    MUT_RANGE_SPLICE,
+  };
+
   size_t result = 0;
+  int chaos = 0;
   for (int retry = 0; retry < MAX_RETRIES && !result; retry++) {
     int strat = select_strategy(st);
-    /* skip MUT_SUBTREE_REPLACE_ADD in havoc (no add_buf available) */
     if (strat == MUT_SUBTREE_REPLACE_ADD) continue;
+    chaos = 0;
+    if (strat == MUT_CHAOS) {
+      chaos = 1;
+      strat = chaos_havoc_targets[rng_below(st, 2)];
+    }
+    st->chaos_active = (uint8_t)chaos;
 
     switch (strat) {
       case MUT_SUBTREE_DELETE:
@@ -1288,10 +1358,11 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
         result = mut_range_splice(st, buf, buf_size, NULL, 0, max_size);
         break;
     }
+    st->chaos_active = 0;
   }
 
   if (result) {
-    st->last_mutation = -1; /* set by individual mutation */
+    st->last_mutation = chaos ? MUT_CHAOS : -1;
     *out_buf = st->out_buf;
     return result;
   }
