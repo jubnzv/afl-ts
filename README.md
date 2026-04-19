@@ -81,3 +81,4 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 | `TS_BANK_SIZE` | `8192` | Max subtree bank entries |
 | `TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
 | `TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |
+| `TS_STACK_MAX` | `1` | Max number of mutations stacked per fuzz call. Each call picks a uniform random depth in `[1, N]`, applying up to N mutations in sequence with a reparse between steps. Clamped to 8. Default `1` = no stacking. |

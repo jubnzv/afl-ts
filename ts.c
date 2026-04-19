@@ -32,6 +32,7 @@
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
 #define MUT_COUNT              10
+#define TS_STACK_HARD_CAP      8
 
 /* ------------------------------------------------------------------ */
 /* Mutation strategy IDs                                               */
@@ -221,6 +222,12 @@ typedef struct {
      immediately after the underlying strategy runs. When set, the
      bank/add/range strategies skip their TSSymbol filter. */
   uint8_t chaos_active;
+
+  /* multi-round stacking (TS_STACK_MAX) */
+  uint32_t stack_max;             /* clamped to [1, TS_STACK_HARD_CAP] */
+  uint8_t *stack_scratch;         /* intermediate buffer, allocated iff stack_max>1 */
+  size_t   stack_scratch_cap;
+  uint32_t last_stack_depth;      /* effective depth of most recent fuzz call */
 
 } TSMutState;
 
@@ -1259,6 +1266,29 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
   const char *hp = getenv("TS_HAVOC_PROB");
   st->havoc_prob = hp ? (uint8_t)atoi(hp) : DEFAULT_HAVOC_PROB;
 
+  /* -- init stacking -- */
+  st->stack_max = 1;
+  st->last_stack_depth = 1;
+  const char *sm = getenv("TS_STACK_MAX");
+  if (sm && sm[0]) {
+    long v = strtol(sm, NULL, 10);
+    if (v < 1) v = 1;
+    if (v > TS_STACK_HARD_CAP) {
+      WARNF("ts mutator: TS_STACK_MAX=%ld clamped to %d",
+            v, TS_STACK_HARD_CAP);
+      v = TS_STACK_HARD_CAP;
+    }
+    st->stack_max = (uint32_t)v;
+  }
+  if (st->stack_max > 1) {
+    st->stack_scratch_cap = 65536;
+    st->stack_scratch = malloc(st->stack_scratch_cap);
+    if (!st->stack_scratch) {
+      st->stack_scratch_cap = 0;
+      st->stack_max = 1;
+    }
+  }
+
   OKF("ts mutator: loaded grammar %s (func=%s, symbols=%u, bank_cap=%u)",
       grammar_path, func_name, st->sym_index_size, st->bank_cap);
 
@@ -1284,6 +1314,7 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
                        uint8_t **out_buf, uint8_t *add_buf,
                        size_t add_buf_size, size_t max_size) {
   TSMutState *st = (TSMutState *)data;
+  st->last_stack_depth = 1;
 
   TSTree *tree = parse_cached(st, buf, buf_size);
   if (!tree || !st->node_count) {
@@ -1291,16 +1322,47 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
     return buf_size;
   }
 
-  size_t result = apply_mutation(st, buf, buf_size, add_buf, add_buf_size,
-                                 max_size);
-  if (result) {
-    *out_buf = st->out_buf;
-    return result;
+  /* Fast path: exactly the original single-mutation behavior. */
+  if (st->stack_max <= 1) {
+    size_t result = apply_mutation(st, buf, buf_size, add_buf, add_buf_size,
+                                   max_size);
+    if (result) { *out_buf = st->out_buf; return result; }
+    *out_buf = buf;
+    return buf_size;
   }
 
-  /* fallback: identity */
-  *out_buf = buf;
-  return buf_size;
+  /* Stacked path: uniform random depth in [1, stack_max]. */
+  uint32_t target = 1 + rng_below(st, st->stack_max);
+
+  size_t cur_len = apply_mutation(st, buf, buf_size, add_buf, add_buf_size,
+                                  max_size);
+  if (!cur_len) { *out_buf = buf; return buf_size; }
+  uint32_t done = 1;
+
+  for (uint32_t step = 1; step < target; step++) {
+    if (cur_len > st->stack_scratch_cap) {
+      size_t nc = st->stack_scratch_cap ? st->stack_scratch_cap : 65536;
+      while (nc < cur_len) nc <<= 1;
+      uint8_t *np = realloc(st->stack_scratch, nc);
+      if (!np) break;
+      st->stack_scratch = np;
+      st->stack_scratch_cap = nc;
+    }
+    memcpy(st->stack_scratch, st->out_buf, cur_len);
+
+    TSTree *t2 = parse_cached(st, st->stack_scratch, cur_len);
+    if (!t2 || !st->node_count) break;
+
+    size_t next_len = apply_mutation(st, st->stack_scratch, cur_len,
+                                     add_buf, add_buf_size, max_size);
+    if (!next_len) break;
+    cur_len = next_len;
+    done++;
+  }
+
+  st->last_stack_depth = done;
+  *out_buf = st->out_buf;
+  return cur_len;
 }
 
 size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
@@ -1314,7 +1376,9 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
   }
 
   /* havoc mode: skip add_buf-based splicing. Chaos in havoc can only
-     target bank + range (no add_buf available). */
+     target bank + range (no add_buf available). Stacking is intentionally
+     disabled here — AFL's per-execution havoc loop already stacks mutations
+     externally, and doubling it here would just amplify noise. */
   static const int chaos_havoc_targets[2] = {
     MUT_SUBTREE_REPLACE_BANK,
     MUT_RANGE_SPLICE,
@@ -1443,7 +1507,10 @@ uint8_t afl_custom_queue_new_entry(void *data,
 
 const char *afl_custom_describe(void *data, size_t max_description_len) {
   TSMutState *st = (TSMutState *)data;
-  if (st->last_mutation >= 0 && st->last_mutation < MUT_COUNT) {
+  if (st->last_stack_depth > 1) {
+    snprintf(st->desc_buf, sizeof(st->desc_buf), "ts-stack%u",
+             st->last_stack_depth);
+  } else if (st->last_mutation >= 0 && st->last_mutation < MUT_COUNT) {
     snprintf(st->desc_buf, sizeof(st->desc_buf), "%s",
              mut_names[st->last_mutation]);
   } else {
@@ -1471,6 +1538,7 @@ void afl_custom_deinit(void *data) {
   free(st->sib_groups);
   free(st->sib_group_members);
   free(st->range_scratch);
+  free(st->stack_scratch);
   free(st->bank);
   free(st->bank_arena);
   free(st->sym_index);
