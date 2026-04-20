@@ -330,7 +330,8 @@ static void collect_nodes(TSMutState *st, TSTree *tree) {
   for (;;) {
     TSNode node = ts_tree_cursor_current_node(&cursor);
 
-    if (ts_node_is_named(node) && !ts_node_has_error(node)) {
+    if (ts_node_is_named(node) && !ts_node_is_error(node) &&
+        !ts_node_is_missing(node)) {
       GROW_ARRAY(st->nodes, st->node_count, st->node_cap, NodeInfo,
                  DEFAULT_NODE_CAP);
 
