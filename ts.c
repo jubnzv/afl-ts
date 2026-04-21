@@ -31,7 +31,7 @@
 #define DEFAULT_ARENA_CAP      (DEFAULT_BANK_CAP * DEFAULT_BANK_MAX_SUB)
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
-#define MUT_COUNT              10
+#define MUT_COUNT              12
 #define TS_STACK_HARD_CAP      8
 
 /* ------------------------------------------------------------------ */
@@ -49,6 +49,8 @@ enum {
   MUT_BANK_INSERT          = 7,
   MUT_RANGE_SPLICE         = 8,
   MUT_CHAOS                = 9,
+  MUT_KLEENE_DELETE        = 10,
+  MUT_KLEENE_INSERT        = 11,
 };
 
 static const uint32_t default_weights[MUT_COUNT] = {
@@ -62,12 +64,15 @@ static const uint32_t default_weights[MUT_COUNT] = {
      7, /* BANK_INSERT          */
      4, /* RANGE_SPLICE         */
      2, /* CHAOS                */
+    10, /* KLEENE_DELETE        */
+    10, /* KLEENE_INSERT        */
 };
 
 static const char *mut_names[MUT_COUNT] = {
     "ts-del", "ts-bank", "ts-add", "ts-swap",
     "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
     "ts-range", "ts-chaos",
+    "ts-kdel", "ts-kins",
 };
 
 /* ------------------------------------------------------------------ */
@@ -416,21 +421,12 @@ static void collect_nodes(TSMutState *st, TSTree *tree) {
       continue;
     }
 
-    /* Stable insertion sort by symbol; same-symbol children keep their
-       relative (source) order, so contiguous runs are contiguous in bytes. */
     uint32_t *kids = &st->sib_group_members[kids_start];
-    for (uint32_t a = 1; a < kids_count; a++) {
-      uint32_t v = kids[a];
-      TSSymbol sv = st->nodes[v].symbol;
-      uint32_t b = a;
-      while (b > 0 && st->nodes[kids[b - 1]].symbol > sv) {
-        kids[b] = kids[b - 1];
-        b--;
-      }
-      kids[b] = v;
-    }
 
-    /* Emit a group for each run of length >=2. */
+    /* Emit a group for each run of consecutive same-symbol siblings in
+       source order. Non-consecutive same-symbol kids are NOT grouped
+       because the byte span between them would cover intervening
+       sibling subtrees. */
     uint32_t run_start = 0;
     for (uint32_t k = 1; k <= kids_count; k++) {
       int boundary = (k == kids_count) ||
@@ -1076,6 +1072,154 @@ static size_t mut_range_splice(TSMutState *st, const uint8_t *buf, size_t len,
   return 0;
 }
 
+/* 10: Delete 1..3 contiguous children from a sibling group */
+static size_t mut_kleene_delete(TSMutState *st, const uint8_t *buf,
+                                size_t len, size_t max_size) {
+  if (!st->sib_group_count) return 0;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    SibGroup *g = &st->sib_groups[rng_below(st, st->sib_group_count)];
+    if (g->count < 2) continue;
+    uint32_t *m = &st->sib_group_members[g->start];
+
+    uint32_t max_k = g->count - 1;
+    if (max_k > 3) max_k = 3;
+    uint32_t K = 1 + rng_below(st, max_k);
+    uint32_t di = rng_below(st, g->count - K + 1);
+    uint32_t dj = di + K;
+
+    uint32_t ds, de;
+    if (di > 0) {
+      ds = st->nodes[m[di - 1]].end_byte;
+      de = st->nodes[m[dj - 1]].end_byte;
+    } else if (dj < g->count) {
+      ds = st->nodes[m[0]].start_byte;
+      de = st->nodes[m[dj]].start_byte;
+    } else {
+      ds = st->nodes[m[0]].start_byte;
+      de = st->nodes[m[g->count - 1]].end_byte;
+    }
+    if (de <= ds || de > len) continue;
+
+    return splice_output(st, buf, len, ds, NULL, 0, de, max_size);
+  }
+  return 0;
+}
+
+/* 11: Insert 1..3 same-symbol children at a random sibling-group boundary */
+static size_t mut_kleene_insert(TSMutState *st, const uint8_t *buf, size_t len,
+                                const uint8_t *add_buf, size_t add_len,
+                                size_t max_size) {
+  if (!st->sib_group_count || !st->range_scratch) return 0;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    SibGroup *g = &st->sib_groups[rng_below(st, st->sib_group_count)];
+    if (g->count < 2) continue;
+    uint32_t *m = &st->sib_group_members[g->start];
+
+    uint32_t sep_s = st->nodes[m[0]].end_byte;
+    uint32_t sep_e = st->nodes[m[1]].start_byte;
+    uint8_t fallback = ' ';
+    const uint8_t *sep;
+    uint32_t sep_len;
+    if (sep_e > sep_s && sep_e <= len) {
+      sep = buf + sep_s;
+      sep_len = sep_e - sep_s;
+    } else {
+      sep = &fallback;
+      sep_len = 1;
+    }
+
+    uint32_t K = 1 + rng_below(st, 3);
+    uint32_t pos = rng_below(st, g->count + 1);
+    int is_append = (pos == g->count);
+    uint32_t ip = is_append ? st->nodes[m[g->count - 1]].end_byte
+                            : st->nodes[m[pos]].start_byte;
+    if (ip > len) continue;
+
+    const uint8_t *donors[3];
+    uint32_t donor_lens[3];
+    uint32_t d_count = 0;
+
+    int use_add = !st->chaos_active && add_buf && add_len &&
+                  (rng_below(st, 3) == 0);
+    if (use_add) {
+      parse_add_cached(st, add_buf, add_len);
+      if (!st->add_node_count) use_add = 0;
+    }
+    int use_dup = !use_add && (rng_below(st, 3) == 0);
+
+    if (use_add) {
+      TSSymbol want = g->symbol;
+      uint32_t pick = rng_below(st, st->add_node_count);
+      for (uint32_t k = 0; k < st->add_node_count && d_count < K; k++) {
+        uint32_t ai = (pick + k) % st->add_node_count;
+        NodeInfo *an = &st->add_nodes[ai];
+        if (!st->chaos_active && an->symbol != want) continue;
+        if (an->end_byte <= an->start_byte || an->end_byte > add_len) continue;
+        donors[d_count] = add_buf + an->start_byte;
+        donor_lens[d_count] = an->end_byte - an->start_byte;
+        d_count++;
+      }
+    } else if (use_dup) {
+      for (uint32_t k = 0; k < K; k++) {
+        uint32_t mi = rng_below(st, g->count);
+        NodeInfo *mn = &st->nodes[m[mi]];
+        if (mn->end_byte <= mn->start_byte || mn->end_byte > len) continue;
+        donors[d_count] = buf + mn->start_byte;
+        donor_lens[d_count] = mn->end_byte - mn->start_byte;
+        d_count++;
+      }
+    } else {
+      if (!st->bank_count) continue;
+      BankIndex *bi = NULL;
+      if (!st->chaos_active) {
+        bank_rebuild_index(st);
+        if (g->symbol >= st->sym_index_size) continue;
+        bi = &st->sym_index[g->symbol];
+        if (bi->count == 0) continue;
+      }
+      for (uint32_t k = 0; k < K; k++) {
+        SubtreeEntry *e;
+        if (st->chaos_active) {
+          e = &st->bank[rng_below(st, st->bank_count)];
+        } else {
+          e = &st->bank[bi->start + rng_below(st, bi->count)];
+        }
+        donors[d_count] = (const uint8_t *)(st->bank_arena + e->text_offset);
+        donor_lens[d_count] = e->text_len;
+        d_count++;
+      }
+    }
+
+    if (!d_count) continue;
+
+    uint32_t acc = 0;
+    int ok = 1;
+    if (is_append) {
+      if (acc + sep_len > st->range_scratch_cap) { ok = 0; }
+      else { memcpy(st->range_scratch + acc, sep, sep_len); acc += sep_len; }
+    }
+    for (uint32_t k = 0; ok && k < d_count; k++) {
+      if (acc + donor_lens[k] > st->range_scratch_cap) { ok = 0; break; }
+      memcpy(st->range_scratch + acc, donors[k], donor_lens[k]);
+      acc += donor_lens[k];
+      int need_sep = is_append ? (k + 1 < d_count) : 1;
+      if (need_sep) {
+        if (acc + sep_len > st->range_scratch_cap) { ok = 0; break; }
+        memcpy(st->range_scratch + acc, sep, sep_len);
+        acc += sep_len;
+      }
+    }
+    if (!ok || !acc) continue;
+    if (len + acc > max_size) continue;
+
+    return splice_output(st, buf, len, ip, st->range_scratch, acc, ip,
+                         max_size);
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Weighted strategy selection                                         */
 /* ------------------------------------------------------------------ */
@@ -1094,11 +1238,11 @@ static int select_strategy(TSMutState *st) {
 static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
                              const uint8_t *add_buf, size_t add_len,
                              size_t max_size) {
-  /* Chaos delegation targets: the three bank/add/range strategies. */
-  static const int chaos_targets[3] = {
+  static const int chaos_targets[4] = {
     MUT_SUBTREE_REPLACE_BANK,
     MUT_SUBTREE_REPLACE_ADD,
     MUT_RANGE_SPLICE,
+    MUT_KLEENE_INSERT,
   };
 
   for (int retry = 0; retry < MAX_RETRIES; retry++) {
@@ -1106,7 +1250,7 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
     int chaos = 0;
     if (strat == MUT_CHAOS) {
       chaos = 1;
-      strat = chaos_targets[rng_below(st, 3)];
+      strat = chaos_targets[rng_below(st, 4)];
     }
     st->chaos_active = (uint8_t)chaos;
 
@@ -1140,6 +1284,12 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
       case MUT_RANGE_SPLICE:
         result = mut_range_splice(st, buf, len, add_buf, add_len, max_size);
         break;
+      case MUT_KLEENE_DELETE:
+        result = mut_kleene_delete(st, buf, len, max_size);
+        break;
+      case MUT_KLEENE_INSERT:
+        result = mut_kleene_insert(st, buf, len, add_buf, add_len, max_size);
+        break;
     }
     st->chaos_active = 0;
 
@@ -1158,10 +1308,11 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+  for (int i = 0; i < MUT_COUNT; i++) w[i] = st->weights[i];
+  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
                  &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7],
-                 &w[8], &w[9]);
-  if (n == MUT_COUNT) {
+                 &w[8], &w[9], &w[10], &w[11]);
+  if (n == 10 || n == MUT_COUNT) {
     memcpy(st->weights, w, sizeof(w));
     st->weight_sum = 0;
     for (int i = 0; i < MUT_COUNT; i++) st->weight_sum += st->weights[i];
@@ -1380,9 +1531,10 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
      target bank + range (no add_buf available). Stacking is intentionally
      disabled here — AFL's per-execution havoc loop already stacks mutations
      externally, and doubling it here would just amplify noise. */
-  static const int chaos_havoc_targets[2] = {
+  static const int chaos_havoc_targets[3] = {
     MUT_SUBTREE_REPLACE_BANK,
     MUT_RANGE_SPLICE,
+    MUT_KLEENE_INSERT,
   };
 
   size_t result = 0;
@@ -1393,7 +1545,7 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
     chaos = 0;
     if (strat == MUT_CHAOS) {
       chaos = 1;
-      strat = chaos_havoc_targets[rng_below(st, 2)];
+      strat = chaos_havoc_targets[rng_below(st, 3)];
     }
     st->chaos_active = (uint8_t)chaos;
 
@@ -1421,6 +1573,12 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
         break;
       case MUT_RANGE_SPLICE:
         result = mut_range_splice(st, buf, buf_size, NULL, 0, max_size);
+        break;
+      case MUT_KLEENE_DELETE:
+        result = mut_kleene_delete(st, buf, buf_size, max_size);
+        break;
+      case MUT_KLEENE_INSERT:
+        result = mut_kleene_insert(st, buf, buf_size, NULL, 0, max_size);
         break;
     }
     st->chaos_active = 0;
