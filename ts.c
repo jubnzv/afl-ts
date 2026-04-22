@@ -1308,11 +1308,10 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  for (int i = 0; i < MUT_COUNT; i++) w[i] = st->weights[i];
   int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
                  &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7],
                  &w[8], &w[9], &w[10], &w[11]);
-  if (n == 10 || n == MUT_COUNT) {
+  if (n == MUT_COUNT) {
     memcpy(st->weights, w, sizeof(w));
     st->weight_sum = 0;
     for (int i = 0; i < MUT_COUNT; i++) st->weight_sum += st->weights[i];

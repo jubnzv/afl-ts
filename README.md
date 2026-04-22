@@ -79,7 +79,7 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 |---|---|---|
 | `TS_GRAMMAR` | **(required)** | Path to grammar `.so` |
 | `TS_LANG_FUNC` | derived from filename | `tree_sitter_*()` symbol name |
-| `TS_WEIGHTS` | `20,20,20,15,10,5,3,7,4,2,10,10` | Comma-separated strategy weights. Accepts either 10 values (legacy, leaves `ts-kdel`/`ts-kins` at defaults) or all 12 |
+| `TS_WEIGHTS` | `20,20,20,15,10,5,3,7,4,2,10,10` | Comma-separated strategy weights |
 | `TS_BANK_SIZE` | `8192` | Max subtree bank entries |
 | `TS_BANK_MAX_SUBTREE` | `256` | Max bytes per banked subtree |
 | `TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |
