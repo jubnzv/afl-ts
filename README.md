@@ -21,7 +21,7 @@ Then clone and build this custom mutator:
 
 ```
 cd AFLplusplus/custom_mutators
-git clone https://github.com/jubnzv/afl-tree-sitter-splice ts
+git clone https://github.com/jubnzv/afl-ts ts
 cd ts
 make
 ```
