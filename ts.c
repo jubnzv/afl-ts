@@ -31,8 +31,10 @@
 #define DEFAULT_ARENA_CAP      (DEFAULT_BANK_CAP * DEFAULT_BANK_MAX_SUB)
 #define DEFAULT_HAVOC_PROB     50
 #define MAX_RETRIES            4
-#define MUT_COUNT              12
+#define MUT_COUNT              13
 #define TS_STACK_HARD_CAP      8
+#define TS_STUTTER_MAX_REPS    8
+#define TS_STUTTER_MAX_GROW_DEFAULT 4
 
 /* ------------------------------------------------------------------ */
 /* Mutation strategy IDs                                               */
@@ -51,6 +53,7 @@ enum {
   MUT_CHAOS                = 9,
   MUT_KLEENE_DELETE        = 10,
   MUT_KLEENE_INSERT        = 11,
+  MUT_TREE_STUTTER         = 12,
 };
 
 static const uint32_t default_weights[MUT_COUNT] = {
@@ -66,6 +69,7 @@ static const uint32_t default_weights[MUT_COUNT] = {
      2, /* CHAOS                */
     10, /* KLEENE_DELETE        */
     10, /* KLEENE_INSERT        */
+     4, /* TREE_STUTTER         */
 };
 
 static const char *mut_names[MUT_COUNT] = {
@@ -73,6 +77,7 @@ static const char *mut_names[MUT_COUNT] = {
     "ts-shrink", "ts-lit", "ts-dup", "ts-ins",
     "ts-range", "ts-chaos",
     "ts-kdel", "ts-kins",
+    "ts-stutter",
 };
 
 /* ------------------------------------------------------------------ */
@@ -215,6 +220,7 @@ typedef struct {
   uint32_t weights[MUT_COUNT];
   uint32_t weight_sum;
   uint8_t  havoc_prob;
+  uint32_t stutter_max_grow;
 
   /* RNG (xorshift64) */
   uint64_t rng;
@@ -1220,6 +1226,112 @@ static size_t mut_kleene_insert(TSMutState *st, const uint8_t *buf, size_t len,
   return 0;
 }
 
+/* 12: Tree stutter (radamsa-style path repetition).
+      Pick outer node O and a strict descendant I that shares O's symbol
+      (chaos: any descendant). Wrap O's prefix/suffix envelope around I
+      n times, where n is log-distributed. Output layout:
+         head | prefix*n | inner | suffix*n | tail
+      The input must contain a non-empty envelope (prefix+suffix > 0) and
+      n must be >= 2 to produce any change. */
+static size_t mut_tree_stutter(TSMutState *st, const uint8_t *buf,
+                               size_t len, size_t max_size) {
+  if (st->node_count < 2) return 0;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    uint32_t i = rng_below(st, st->node_count);
+    NodeInfo *outer = &st->nodes[i];
+    if (outer->named_children == 0) continue;
+    if (outer->end_byte <= outer->start_byte) continue;
+
+    /* reservoir-sample up to 16 eligible descendants in DFS order */
+    uint32_t cands[16];
+    uint32_t cand_count = 0;
+    for (uint32_t j = i + 1; j < st->node_count; j++) {
+      NodeInfo *inner = &st->nodes[j];
+      if (inner->start_byte >= outer->end_byte) break;
+      if (inner->end_byte > outer->end_byte) continue;
+      if (inner->end_byte <= inner->start_byte) continue;
+
+      int eligible = st->chaos_active ? 1 : (inner->symbol == outer->symbol);
+      if (!eligible) continue;
+
+      if (cand_count < 16) {
+        cands[cand_count] = j;
+      } else {
+        uint32_t r = rng_below(st, cand_count + 1);
+        if (r < 16) cands[r] = j;
+      }
+      cand_count++;
+    }
+    if (!cand_count) continue;
+
+    uint32_t pick_n = cand_count < 16 ? cand_count : 16;
+    NodeInfo *inner = &st->nodes[cands[rng_below(st, pick_n)]];
+
+    uint32_t prefix_len = inner->start_byte - outer->start_byte;
+    uint32_t inner_len  = inner->end_byte - inner->start_byte;
+    uint32_t suffix_len = outer->end_byte - inner->end_byte;
+    uint32_t outer_len  = outer->end_byte - outer->start_byte;
+    uint32_t env        = prefix_len + suffix_len;
+    if (env == 0) continue;  /* nothing to stutter */
+
+    /* log-distributed reps: bits in {0..3}, n in [2, 2 + (1<<bits)],
+       capped at TS_STUTTER_MAX_REPS. Heavy bias toward small n. */
+    uint32_t bits = rng_below(st, 4);
+    uint32_t n = 2 + rng_below(st, 1u << bits);
+    if (n > TS_STUTTER_MAX_REPS) n = TS_STUTTER_MAX_REPS;
+
+    /* size cap: respect both max_size and the configurable growth bound */
+    size_t base_total = len - outer_len;
+    size_t cap = max_size;
+    size_t grow_cap = (size_t)st->stutter_max_grow * len;
+    if (grow_cap < cap) cap = grow_cap;
+
+    while (n >= 2) {
+      size_t new_outer = (size_t)n * env + inner_len;
+      if (base_total + new_outer <= cap) break;
+      n--;
+    }
+    if (n < 2) continue;
+
+    size_t new_total = base_total + (size_t)n * env + inner_len;
+    ensure_out(st, new_total);
+    if (st->out_cap < new_total) return 0;
+
+    uint8_t *o = st->out_buf;
+    size_t pos = 0;
+
+    if (outer->start_byte) {
+      memcpy(o + pos, buf, outer->start_byte);
+      pos += outer->start_byte;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+      if (prefix_len) {
+        memcpy(o + pos, buf + outer->start_byte, prefix_len);
+        pos += prefix_len;
+      }
+    }
+    if (inner_len) {
+      memcpy(o + pos, buf + inner->start_byte, inner_len);
+      pos += inner_len;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+      if (suffix_len) {
+        memcpy(o + pos, buf + inner->end_byte, suffix_len);
+        pos += suffix_len;
+      }
+    }
+    size_t tail_len = len - outer->end_byte;
+    if (tail_len) {
+      memcpy(o + pos, buf + outer->end_byte, tail_len);
+      pos += tail_len;
+    }
+
+    return pos;
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Weighted strategy selection                                         */
 /* ------------------------------------------------------------------ */
@@ -1238,11 +1350,12 @@ static int select_strategy(TSMutState *st) {
 static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
                              const uint8_t *add_buf, size_t add_len,
                              size_t max_size) {
-  static const int chaos_targets[4] = {
+  static const int chaos_targets[5] = {
     MUT_SUBTREE_REPLACE_BANK,
     MUT_SUBTREE_REPLACE_ADD,
     MUT_RANGE_SPLICE,
     MUT_KLEENE_INSERT,
+    MUT_TREE_STUTTER,
   };
 
   for (int retry = 0; retry < MAX_RETRIES; retry++) {
@@ -1250,7 +1363,7 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
     int chaos = 0;
     if (strat == MUT_CHAOS) {
       chaos = 1;
-      strat = chaos_targets[rng_below(st, 4)];
+      strat = chaos_targets[rng_below(st, 5)];
     }
     st->chaos_active = (uint8_t)chaos;
 
@@ -1290,6 +1403,9 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
       case MUT_KLEENE_INSERT:
         result = mut_kleene_insert(st, buf, len, add_buf, add_len, max_size);
         break;
+      case MUT_TREE_STUTTER:
+        result = mut_tree_stutter(st, buf, len, max_size);
+        break;
     }
     st->chaos_active = 0;
 
@@ -1305,17 +1421,31 @@ static size_t apply_mutation(TSMutState *st, const uint8_t *buf, size_t len,
 /* Config parsing helpers                                              */
 /* ------------------------------------------------------------------ */
 
+/* Parse a comma-separated weight list. Accepts any prefix length up to
+   MUT_COUNT — unspecified slots keep their current (default) value. This
+   keeps older configs (12 weights, missing the new ts-stutter slot) working
+   without forcing every caller to update at once. */
 static void parse_weights(TSMutState *st, const char *str) {
   if (!str) return;
   uint32_t w[MUT_COUNT];
-  int n = sscanf(str, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
-                 &w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7],
-                 &w[8], &w[9], &w[10], &w[11]);
-  if (n == MUT_COUNT) {
-    memcpy(st->weights, w, sizeof(w));
-    st->weight_sum = 0;
-    for (int i = 0; i < MUT_COUNT; i++) st->weight_sum += st->weights[i];
+  memcpy(w, st->weights, sizeof(w));
+
+  const char *p = str;
+  int idx = 0;
+  while (*p && idx < MUT_COUNT) {
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p) break;
+    if (v < 0) v = 0;
+    w[idx++] = (uint32_t)v;
+    if (*end != ',') break;
+    p = end + 1;
   }
+  if (idx == 0) return;
+
+  memcpy(st->weights, w, sizeof(w));
+  st->weight_sum = 0;
+  for (int i = 0; i < MUT_COUNT; i++) st->weight_sum += st->weights[i];
 }
 
 /* Derive function name from .so path: libtree-sitter-foo.so -> tree_sitter_foo */
@@ -1416,6 +1546,11 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
 
   const char *hp = getenv("TS_HAVOC_PROB");
   st->havoc_prob = hp ? (uint8_t)atoi(hp) : DEFAULT_HAVOC_PROB;
+
+  const char *smg = getenv("TS_STUTTER_MAX_GROW");
+  st->stutter_max_grow = smg ? (uint32_t)atoi(smg)
+                             : TS_STUTTER_MAX_GROW_DEFAULT;
+  if (st->stutter_max_grow < 2) st->stutter_max_grow = 2;
 
   /* -- init stacking -- */
   st->stack_max = 1;
@@ -1530,10 +1665,11 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
      target bank + range (no add_buf available). Stacking is intentionally
      disabled here — AFL's per-execution havoc loop already stacks mutations
      externally, and doubling it here would just amplify noise. */
-  static const int chaos_havoc_targets[3] = {
+  static const int chaos_havoc_targets[4] = {
     MUT_SUBTREE_REPLACE_BANK,
     MUT_RANGE_SPLICE,
     MUT_KLEENE_INSERT,
+    MUT_TREE_STUTTER,
   };
 
   size_t result = 0;
@@ -1544,7 +1680,7 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
     chaos = 0;
     if (strat == MUT_CHAOS) {
       chaos = 1;
-      strat = chaos_havoc_targets[rng_below(st, 3)];
+      strat = chaos_havoc_targets[rng_below(st, 4)];
     }
     st->chaos_active = (uint8_t)chaos;
 
@@ -1578,6 +1714,9 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
         break;
       case MUT_KLEENE_INSERT:
         result = mut_kleene_insert(st, buf, buf_size, NULL, 0, max_size);
+        break;
+      case MUT_TREE_STUTTER:
+        result = mut_tree_stutter(st, buf, buf_size, max_size);
         break;
     }
     st->chaos_active = 0;
