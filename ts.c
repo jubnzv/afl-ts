@@ -1596,13 +1596,69 @@ uint32_t afl_custom_fuzz_count(void *data, const uint8_t *buf,
   return count;
 }
 
+/* Region-aware input format used by the solidity-fuzzing harness:
+ *
+ *   [source bytes][calldata bytes][u16 LE source_len][0xCA 0xFE]
+ *
+ * When the magic 0xCA 0xFE suffix is present and the encoded source_len
+ * fits in the buffer, only the leading source_len bytes are passed to
+ * tree-sitter; calldata + trailer are preserved verbatim through the
+ * mutation. This lets the harness bind AFL's byte-level havoc to calldata
+ * while afl-ts continues to mutate the Solidity source via AST splice.
+ *
+ * Inputs without the magic suffix are handled exactly as before
+ * (source_len = buf_size, calldata_len = 0, no trailer).
+ */
+static int region_split(const uint8_t *buf, size_t buf_size,
+                        size_t *source_len, size_t *calldata_len) {
+  *source_len = buf_size;
+  *calldata_len = 0;
+  if (buf_size < 4) return 0;
+  if (buf[buf_size - 2] != 0xCA || buf[buf_size - 1] != 0xFE) return 0;
+  size_t len = (size_t)buf[buf_size - 4] | ((size_t)buf[buf_size - 3] << 8);
+  if (len > buf_size - 4) return 0;
+  *source_len = len;
+  *calldata_len = (buf_size - 4) - len;
+  return 1;
+}
+
+/* Append calldata bytes + 4-byte trailer to st->out_buf after a
+ * source-only mutation of length mut_len. Returns the new total length,
+ * or 0 if growing st->out_buf failed. */
+static size_t region_assemble(TSMutState *st, size_t mut_len,
+                              const uint8_t *calldata, size_t calldata_len) {
+  size_t total = mut_len + calldata_len + 4;
+  ensure_out(st, total);
+  if (st->out_cap < total) return 0;
+  if (calldata_len) memcpy(st->out_buf + mut_len, calldata, calldata_len);
+  uint8_t *t = st->out_buf + mut_len + calldata_len;
+  t[0] = (uint8_t)(mut_len & 0xff);
+  t[1] = (uint8_t)((mut_len >> 8) & 0xff);
+  t[2] = 0xCA;
+  t[3] = 0xFE;
+  return total;
+}
+
 size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
                        uint8_t **out_buf, uint8_t *add_buf,
                        size_t add_buf_size, size_t max_size) {
   TSMutState *st = (TSMutState *)data;
   st->last_stack_depth = 1;
 
-  TSTree *tree = parse_cached(st, buf, buf_size);
+  size_t source_len, calldata_len;
+  int has_region = region_split(buf, buf_size, &source_len, &calldata_len);
+
+  size_t add_source_len = add_buf_size;
+  if (add_buf && add_buf_size) {
+    size_t add_calldata_len;
+    region_split(add_buf, add_buf_size, &add_source_len, &add_calldata_len);
+  }
+
+  size_t reserved = has_region ? calldata_len + 4 : 0;
+  if (max_size <= reserved) { *out_buf = buf; return buf_size; }
+  size_t inner_max = max_size - reserved;
+
+  TSTree *tree = parse_cached(st, buf, source_len);
   if (!tree || !st->node_count) {
     *out_buf = buf;
     return buf_size;
@@ -1610,9 +1666,19 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
 
   /* Fast path: exactly the original single-mutation behavior. */
   if (st->stack_max <= 1) {
-    size_t result = apply_mutation(st, buf, buf_size, add_buf, add_buf_size,
-                                   max_size);
-    if (result) { *out_buf = st->out_buf; return result; }
+    size_t result = apply_mutation(st, buf, source_len, add_buf,
+                                   add_source_len, inner_max);
+    if (result) {
+      if (has_region) {
+        size_t total = region_assemble(st, result, buf + source_len,
+                                       calldata_len);
+        if (!total) { *out_buf = buf; return buf_size; }
+        *out_buf = st->out_buf;
+        return total;
+      }
+      *out_buf = st->out_buf;
+      return result;
+    }
     *out_buf = buf;
     return buf_size;
   }
@@ -1620,8 +1686,8 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
   /* Stacked path: uniform random depth in [1, stack_max]. */
   uint32_t target = 1 + rng_below(st, st->stack_max);
 
-  size_t cur_len = apply_mutation(st, buf, buf_size, add_buf, add_buf_size,
-                                  max_size);
+  size_t cur_len = apply_mutation(st, buf, source_len, add_buf,
+                                  add_source_len, inner_max);
   if (!cur_len) { *out_buf = buf; return buf_size; }
   uint32_t done = 1;
 
@@ -1640,13 +1706,21 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
     if (!t2 || !st->node_count) break;
 
     size_t next_len = apply_mutation(st, st->stack_scratch, cur_len,
-                                     add_buf, add_buf_size, max_size);
+                                     add_buf, add_source_len, inner_max);
     if (!next_len) break;
     cur_len = next_len;
     done++;
   }
 
   st->last_stack_depth = done;
+
+  if (has_region) {
+    size_t total = region_assemble(st, cur_len, buf + source_len,
+                                   calldata_len);
+    if (!total) { *out_buf = buf; return buf_size; }
+    *out_buf = st->out_buf;
+    return total;
+  }
   *out_buf = st->out_buf;
   return cur_len;
 }
@@ -1655,7 +1729,13 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
                                  uint8_t **out_buf, size_t max_size) {
   TSMutState *st = (TSMutState *)data;
 
-  TSTree *tree = parse_cached(st, buf, buf_size);
+  size_t source_len, calldata_len;
+  int has_region = region_split(buf, buf_size, &source_len, &calldata_len);
+  size_t reserved = has_region ? calldata_len + 4 : 0;
+  if (max_size <= reserved) { *out_buf = buf; return buf_size; }
+  size_t inner_max = max_size - reserved;
+
+  TSTree *tree = parse_cached(st, buf, source_len);
   if (!tree || !st->node_count) {
     *out_buf = buf;
     return buf_size;
@@ -1686,37 +1766,37 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
 
     switch (strat) {
       case MUT_SUBTREE_DELETE:
-        result = mut_subtree_delete(st, buf, buf_size, max_size);
+        result = mut_subtree_delete(st, buf, source_len, inner_max);
         break;
       case MUT_SUBTREE_REPLACE_BANK:
-        result = mut_subtree_replace_bank(st, buf, buf_size, max_size);
+        result = mut_subtree_replace_bank(st, buf, source_len, inner_max);
         break;
       case MUT_SIBLING_SWAP:
-        result = mut_sibling_swap(st, buf, buf_size, max_size);
+        result = mut_sibling_swap(st, buf, source_len, inner_max);
         break;
       case MUT_RECURSIVE_SHRINK:
-        result = mut_recursive_shrink(st, buf, buf_size, max_size);
+        result = mut_recursive_shrink(st, buf, source_len, inner_max);
         break;
       case MUT_LITERAL_REPLACE:
-        result = mut_literal_replace(st, buf, buf_size, max_size);
+        result = mut_literal_replace(st, buf, source_len, inner_max);
         break;
       case MUT_SUBTREE_DUPLICATE:
-        result = mut_subtree_duplicate(st, buf, buf_size, max_size);
+        result = mut_subtree_duplicate(st, buf, source_len, inner_max);
         break;
       case MUT_BANK_INSERT:
-        result = mut_bank_insert(st, buf, buf_size, max_size);
+        result = mut_bank_insert(st, buf, source_len, inner_max);
         break;
       case MUT_RANGE_SPLICE:
-        result = mut_range_splice(st, buf, buf_size, NULL, 0, max_size);
+        result = mut_range_splice(st, buf, source_len, NULL, 0, inner_max);
         break;
       case MUT_KLEENE_DELETE:
-        result = mut_kleene_delete(st, buf, buf_size, max_size);
+        result = mut_kleene_delete(st, buf, source_len, inner_max);
         break;
       case MUT_KLEENE_INSERT:
-        result = mut_kleene_insert(st, buf, buf_size, NULL, 0, max_size);
+        result = mut_kleene_insert(st, buf, source_len, NULL, 0, inner_max);
         break;
       case MUT_TREE_STUTTER:
-        result = mut_tree_stutter(st, buf, buf_size, max_size);
+        result = mut_tree_stutter(st, buf, source_len, inner_max);
         break;
     }
     st->chaos_active = 0;
@@ -1724,6 +1804,13 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
 
   if (result) {
     st->last_mutation = chaos ? MUT_CHAOS : -1;
+    if (has_region) {
+      size_t total = region_assemble(st, result, buf + source_len,
+                                     calldata_len);
+      if (!total) { *out_buf = buf; return buf_size; }
+      *out_buf = st->out_buf;
+      return total;
+    }
     *out_buf = st->out_buf;
     return result;
   }
