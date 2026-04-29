@@ -86,6 +86,14 @@ The subtree bank is populated via `afl_custom_queue_new_entry` as the corpus gro
 | `TS_HAVOC_PROB` | `50` | Havoc mutation probability (%) |
 | `TS_STACK_MAX` | `1` | Max number of mutations stacked per fuzz call. Each call picks a uniform random depth in `[1, N]`, applying up to N mutations in sequence with a reparse between steps. Clamped to 8. Default `1` = no stacking. |
 | `TS_STUTTER_MAX_GROW` | `4` | `ts-stutter` size cap as a multiplier of input length. Output never grows beyond `N × len`. Minimum 2. |
+| `TS_REGION_MODE` | `0` (off) | Enable region-aware mutation (see below) |
+| `TS_REGION_MAGIC` | `CAFE` | u16 magic used to mark region-aware inputs. Hex digits only. |
+
+## Region-aware mutation
+
+With `TS_REGION_MODE=1`, inputs framed as `[source][tail][u16 LE source_len][magic]` get only the leading `source_len` bytes mutated; the tail is preserved verbatim.
+
+Use case: Solidity harness packs `[source][ABI calldata][len][0xCAFE]` so afl-ts mutates the source while AFL byte-havoc chews the calldata.
 
 ## Performance notes
 

@@ -222,6 +222,10 @@ typedef struct {
   uint8_t  havoc_prob;
   uint32_t stutter_max_grow;
 
+  /* region-aware mode (TS_REGION_MODE / TS_REGION_MAGIC) */
+  uint8_t  region_mode;    /* 0 = off (default), 1 = on */
+  uint16_t region_magic;   /* default 0xCAFE */
+
   /* RNG (xorshift64) */
   uint64_t rng;
 
@@ -1552,6 +1556,18 @@ void *afl_custom_init(afl_state_t *afl, unsigned int seed) {
                              : TS_STUTTER_MAX_GROW_DEFAULT;
   if (st->stutter_max_grow < 2) st->stutter_max_grow = 2;
 
+  /* -- region-aware mode (opt-in) -- */
+  const char *rm = getenv("TS_REGION_MODE");
+  st->region_mode = (rm && rm[0] && rm[0] != '0') ? 1 : 0;
+
+  st->region_magic = 0xCAFE;
+  const char *rmg = getenv("TS_REGION_MAGIC");
+  if (rmg && rmg[0]) {
+    char *end = NULL;
+    unsigned long v = strtoul(rmg, &end, 16);
+    if (end != rmg && v <= 0xFFFFu) st->region_magic = (uint16_t)v;
+  }
+
   /* -- init stacking -- */
   st->stack_max = 1;
   st->last_stack_depth = 1;
@@ -1596,46 +1612,54 @@ uint32_t afl_custom_fuzz_count(void *data, const uint8_t *buf,
   return count;
 }
 
-/* Region-aware input format used by the solidity-fuzzing harness:
+/* Region-aware input format (opt-in via TS_REGION_MODE=1):
  *
- *   [source bytes][calldata bytes][u16 LE source_len][0xCA 0xFE]
+ *   [source bytes][opaque tail bytes][u16 LE source_len][magic_lo magic_hi]
  *
- * When the magic 0xCA 0xFE suffix is present and the encoded source_len
+ * When the trailing magic suffix is present and the encoded source_len
  * fits in the buffer, only the leading source_len bytes are passed to
- * tree-sitter; calldata + trailer are preserved verbatim through the
- * mutation. This lets the harness bind AFL's byte-level havoc to calldata
- * while afl-ts continues to mutate the Solidity source via AST splice.
+ * tree-sitter; the opaque tail and the trailer are preserved verbatim
+ * through the mutation. This lets a harness bind AFL's byte-level havoc
+ * to a binary blob (e.g. ABI calldata) while afl-ts continues to mutate
+ * the parseable text region via AST splice.
  *
- * Inputs without the magic suffix are handled exactly as before
- * (source_len = buf_size, calldata_len = 0, no trailer).
+ * Both knobs are read once at init:
+ *   TS_REGION_MODE  : 0 = off (default), 1 = on
+ *   TS_REGION_MAGIC : u16 hex; default 0xCAFE
+ *                     stored little-endian in the trailer (lo byte at
+ *                     buf[size-2], hi byte at buf[size-1])
  */
-static int region_split(const uint8_t *buf, size_t buf_size,
-                        size_t *source_len, size_t *calldata_len) {
+static int region_split(const TSMutState *st, const uint8_t *buf,
+                        size_t buf_size, size_t *source_len,
+                        size_t *tail_len) {
   *source_len = buf_size;
-  *calldata_len = 0;
+  *tail_len = 0;
+  if (!st->region_mode) return 0;
   if (buf_size < 4) return 0;
-  if (buf[buf_size - 2] != 0xCA || buf[buf_size - 1] != 0xFE) return 0;
+  uint8_t lo = (uint8_t)(st->region_magic & 0xff);
+  uint8_t hi = (uint8_t)((st->region_magic >> 8) & 0xff);
+  if (buf[buf_size - 2] != lo || buf[buf_size - 1] != hi) return 0;
   size_t len = (size_t)buf[buf_size - 4] | ((size_t)buf[buf_size - 3] << 8);
   if (len > buf_size - 4) return 0;
   *source_len = len;
-  *calldata_len = (buf_size - 4) - len;
+  *tail_len = (buf_size - 4) - len;
   return 1;
 }
 
-/* Append calldata bytes + 4-byte trailer to st->out_buf after a
- * source-only mutation of length mut_len. Returns the new total length,
- * or 0 if growing st->out_buf failed. */
+/* Append the preserved tail bytes + 4-byte trailer to st->out_buf after
+ * a source-only mutation of length mut_len. Returns the new total
+ * length, or 0 if growing st->out_buf failed. */
 static size_t region_assemble(TSMutState *st, size_t mut_len,
-                              const uint8_t *calldata, size_t calldata_len) {
-  size_t total = mut_len + calldata_len + 4;
+                              const uint8_t *tail, size_t tail_len) {
+  size_t total = mut_len + tail_len + 4;
   ensure_out(st, total);
   if (st->out_cap < total) return 0;
-  if (calldata_len) memcpy(st->out_buf + mut_len, calldata, calldata_len);
-  uint8_t *t = st->out_buf + mut_len + calldata_len;
+  if (tail_len) memcpy(st->out_buf + mut_len, tail, tail_len);
+  uint8_t *t = st->out_buf + mut_len + tail_len;
   t[0] = (uint8_t)(mut_len & 0xff);
   t[1] = (uint8_t)((mut_len >> 8) & 0xff);
-  t[2] = 0xCA;
-  t[3] = 0xFE;
+  t[2] = (uint8_t)(st->region_magic & 0xff);
+  t[3] = (uint8_t)((st->region_magic >> 8) & 0xff);
   return total;
 }
 
@@ -1645,16 +1669,16 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
   TSMutState *st = (TSMutState *)data;
   st->last_stack_depth = 1;
 
-  size_t source_len, calldata_len;
-  int has_region = region_split(buf, buf_size, &source_len, &calldata_len);
+  size_t source_len, tail_len;
+  int has_region = region_split(st, buf, buf_size, &source_len, &tail_len);
 
   size_t add_source_len = add_buf_size;
   if (add_buf && add_buf_size) {
-    size_t add_calldata_len;
-    region_split(add_buf, add_buf_size, &add_source_len, &add_calldata_len);
+    size_t add_tail_len;
+    region_split(st, add_buf, add_buf_size, &add_source_len, &add_tail_len);
   }
 
-  size_t reserved = has_region ? calldata_len + 4 : 0;
+  size_t reserved = has_region ? tail_len + 4 : 0;
   if (max_size <= reserved) { *out_buf = buf; return buf_size; }
   size_t inner_max = max_size - reserved;
 
@@ -1671,7 +1695,7 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
     if (result) {
       if (has_region) {
         size_t total = region_assemble(st, result, buf + source_len,
-                                       calldata_len);
+                                       tail_len);
         if (!total) { *out_buf = buf; return buf_size; }
         *out_buf = st->out_buf;
         return total;
@@ -1716,7 +1740,7 @@ size_t afl_custom_fuzz(void *data, uint8_t *buf, size_t buf_size,
 
   if (has_region) {
     size_t total = region_assemble(st, cur_len, buf + source_len,
-                                   calldata_len);
+                                   tail_len);
     if (!total) { *out_buf = buf; return buf_size; }
     *out_buf = st->out_buf;
     return total;
@@ -1729,9 +1753,9 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
                                  uint8_t **out_buf, size_t max_size) {
   TSMutState *st = (TSMutState *)data;
 
-  size_t source_len, calldata_len;
-  int has_region = region_split(buf, buf_size, &source_len, &calldata_len);
-  size_t reserved = has_region ? calldata_len + 4 : 0;
+  size_t source_len, tail_len;
+  int has_region = region_split(st, buf, buf_size, &source_len, &tail_len);
+  size_t reserved = has_region ? tail_len + 4 : 0;
   if (max_size <= reserved) { *out_buf = buf; return buf_size; }
   size_t inner_max = max_size - reserved;
 
@@ -1806,7 +1830,7 @@ size_t afl_custom_havoc_mutation(void *data, uint8_t *buf, size_t buf_size,
     st->last_mutation = chaos ? MUT_CHAOS : -1;
     if (has_region) {
       size_t total = region_assemble(st, result, buf + source_len,
-                                     calldata_len);
+                                     tail_len);
       if (!total) { *out_buf = buf; return buf_size; }
       *out_buf = st->out_buf;
       return total;
